@@ -103,14 +103,16 @@ def validate_mattermost_config(config: PlatformConfig) -> bool:
 
 # An emoji-only final reply becomes one reaction on the triggering post instead of a new post
 # (owner preference: ack by emoji, keep the channel quiet). Keys are normalized (no variation
-# selector U+FE0F); values are Mattermost's bundled emoji shortnames.
+# selector U+FE0F); values are Mattermost's bundled emoji shortnames. 👀 and ✅ are deliberately
+# absent: the gateway uses them as lifecycle signals (eyes on intake, white_check_mark on turn
+# completion), so an emoji-only model reply of either posts as text instead of doubling the signal.
 _EMOJI_REACTION_NAMES = {
     "👋": "wave", "👍": "+1", "👎": "-1", "❤": "heart", "😀": "smile",
     "🙂": "slightly_smiling_face", "😅": "sweat_smile", "😂": "laughing",
     "🤣": "laughing", "🎉": "tada", "🙏": "pray", "🔥": "fire", "👏": "clap",
     "💪": "muscle", "🚀": "rocket", "👌": "ok_hand", "🤔": "thinking_face",
     "😎": "sunglasses", "🥳": "partying_face", "😢": "cry", "😭": "sob",
-    "👀": "eyes", "❗": "exclamation", "❓": "question", "✅": "white_check_mark",
+    "❗": "exclamation", "❓": "question",
 }
 
 
@@ -785,11 +787,16 @@ _is_connected = _env_is_connected("MATTERMOST_TOKEN", "MATTERMOST_URL")
 
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
 _PLATFORM_HINT = (
-    "You are in a Mattermost workspace communicating with your user. Mattermost renders standard "
-    "Markdown — headings, bold, italic, code blocks, and tables all work. You can send media files "
-    "natively: include MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, .webp) are "
-    "uploaded as photo attachments, audio and video as file attachments. Image URLs in markdown format "
-    "![alt](url) are rendered as inline previews automatically."
+    "You are in a Mattermost workspace communicating with your user. You are a bot account: "
+    "you see direct messages and only the channels that the bot account is a member of, and you "
+    "cannot read a channel that nobody added the bot to. Answer questions about your own access "
+    "from this knowledge alone; do not inspect config files or run commands to find out what you "
+    "can access. "
+    "Mattermost renders standard Markdown — headings, bold, italic, code blocks, and tables all "
+    "work. You can send media files natively: include MEDIA:/absolute/path/to/file in your "
+    "response. Images (.jpg, .png, .webp) are uploaded as photo attachments, audio and video as "
+    "file attachments. Image URLs in markdown format ![alt](url) are rendered as inline previews "
+    "automatically."
 )
 
 
