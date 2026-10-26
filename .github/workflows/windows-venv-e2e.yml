@@ -59,6 +59,22 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: "rf14 TEMP (never merge): #144890 consent + holder + packaged-cwd live proof"
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          bash scripts/run_tests.sh \
+            tests/hermes_cli/test_desktop_release_holder_windows_live.py \
+            tests/hermes_cli/test_desktop_release_holders.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_release_holders.py
+          py=$?
+          npm ci --ignore-scripts --no-audit --no-fund > /dev/null 2>&1
+          (cd apps/desktop && npx vitest run electron/packaged-working-directory.test.ts electron/release-holder-consent.test.ts --reporter=verbose)
+          js=$?
+          echo "RF14_RESULT python=$py vitest=$js"
+          exit $(( py || js ))
+
       - name: Run venv-holder live E2E
         # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
         # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
