@@ -101,6 +101,19 @@ def validate_mattermost_config(config: PlatformConfig) -> bool:
     return True
 
 
+# An emoji-only final reply becomes one reaction on the triggering post instead of a new post
+# (owner preference: ack by emoji, keep the channel quiet). Keys are normalized (no variation
+# selector U+FE0F); values are Mattermost's bundled emoji shortnames.
+_EMOJI_REACTION_NAMES = {
+    "👋": "wave", "👍": "+1", "👎": "-1", "❤": "heart", "😀": "smile",
+    "🙂": "slightly_smiling_face", "😅": "sweat_smile", "😂": "laughing",
+    "🤣": "laughing", "🎉": "tada", "🙏": "pray", "🔥": "fire", "👏": "clap",
+    "💪": "muscle", "🚀": "rocket", "👌": "ok_hand", "🤔": "thinking_face",
+    "😎": "sunglasses", "🥳": "partying_face", "😢": "cry", "😭": "sob",
+    "👀": "eyes", "❗": "exclamation", "❓": "question", "✅": "white_check_mark",
+}
+
+
 class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
@@ -123,6 +136,10 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
+        # Lifecycle reactions (👀 on admitted message, ✅ on replied); see _react().
+        self._lifecycle_reactions = str(_extra_or_secret(
+            self.config.extra, "lifecycle_reactions", "MATTERMOST_LIFECYCLE_REACTIONS",
+            "true", blank_is_unset=False)).lower() not in {"false", "0", "no"}
 
     # --- HTTP helpers ---
 
@@ -169,6 +186,40 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._api("POST", path, payload)
+
+    async def _react(self, post_id: str, emoji_name: str) -> bool:
+        """Best-effort reaction on a post (POST /api/v4/reactions with the bot's user_id).
+        Returns True when the server accepted it; callers may post text as a fallback.
+
+        Reactions never replace or block a reply: every failure path only logs. Call this only
+        when no post bookkeeping is pending (the POST side-effect in _api overwrites
+        _last_post_status/_last_post_error, which _post_preserving_thread reads right after
+        sending) — i.e. never between a post and its status check.
+        """
+        if not (self._lifecycle_reactions and post_id and re.fullmatch(r"[a-z0-9_+-]+", emoji_name or "")):
+            return False
+        if not await self._api("POST", "reactions",
+                               {"user_id": self._bot_user_id, "post_id": post_id, "emoji_name": emoji_name}):
+            logger.warning("Mattermost: reaction %s on post %s failed", emoji_name, post_id)
+            return False
+        return True
+
+    def _may_ack_sender(self, sender_id: str) -> bool:
+        """Mirror of the gateway allowlist admission, scoped to the pre-turn ack reaction.
+
+        The real MATTERMOST_ALLOWED_USERS check runs in the gateway env layer *after* the
+        adapter. This lookalike only decides whether the 👀 ack may fire, so a stale value can
+        never admit a reply — at worst it silences an ack. Empty allowlist = open access,
+        matching interactive_setup semantics.
+        """
+        allow_all = str(_extra_or_secret(self.config.extra, "allow_all_users",
+                                         "MATTERMOST_ALLOW_ALL_USERS", "", blank_is_unset=False)).strip().lower()
+        if allow_all in {"true", "1", "yes", "all"}:
+            return True
+        allow_from = _channel_id_set(_extra_or_secret(self.config.extra, "allowed_users",
+                                                      "MATTERMOST_ALLOWED_USERS", "", blank_is_unset=False))
+        return sender_id in allow_from if allow_from else True
+
 
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
@@ -275,11 +326,23 @@ class MattermostAdapter(BasePlatformAdapter):
         """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
         if not content:
             return SendResult(success=True)
+        ack_target = reply_to or (isinstance(metadata, dict)
+                                   and (metadata.get("thread_id") or metadata.get("root_id")))
+        # Emoji-only reply: react on the triggering post instead of posting it. When the API
+        # refuses (or the trigger is unidentifiable), fall through and post the emoji as text.
+        if ack_target:
+            if (reply_emoji := str(content).strip().replace("\ufe0f", "")) in _EMOJI_REACTION_NAMES:
+                if await self._react(str(ack_target), _EMOJI_REACTION_NAMES[reply_emoji]):
+                    return SendResult(success=True)
         result = SendResult(success=True)
         for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
             result = _post_result(await self._post_message(chat_id, chunk, reply_to, metadata), "Failed to create post")
             if not result.success:
                 break
+        # Turn complete: ✅ on the post that started it, when identifiable from the send args.
+        # Runs after the chunk loop so reaction bookkeeping cannot touch post-status checks.
+        if result.success and ack_target:
+            await self._react(str(ack_target), "white_check_mark")
         return result
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
@@ -584,6 +647,11 @@ class MattermostAdapter(BasePlatformAdapter):
             chat_id=channel_id, chat_type=_CHANNEL_TYPE_MAP.get(data.get("channel_type", "O"), "channel"),
             user_id=sender_id, user_name=data.get("sender_name", "").lstrip("@") or sender_id,
             thread_id=thread_id, message_id=post_id)
+        # Pre-turn ack: 👀 tells the sender the message reached the bot before the model
+        # starts processing. Only for senders the allowlist would admit, so strangers get
+        # no signal; failures are swallowed inside _react and never block the turn.
+        if self._may_ack_sender(sender_id):
+            await self._react(post_id, "eyes")
         from gateway.platforms.base import resolve_channel_prompt
         await self.handle_message(MessageEvent(
             text=message_text, message_type=msg_type, source=source, raw_message=post, message_id=post_id,
